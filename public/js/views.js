@@ -2,7 +2,7 @@
 import { html, useState, useEffect, useRef } from '/vendor/preact-htm.js';
 import { SPACES, SPACE_MAP, LIMITS } from './config.js';
 import {
-  store, send, toast, go, doJoin, createSession, leaveSession, LS, identKey, spaceHash,
+  store, send, toast, go, doJoin, createSession, restoreSession, leaveSession, LS, identKey, spaceHash,
 } from './store.js';
 import {
   ContribForm, ContributionCard, QuestionCard, QuestionAdmin, QuestionCreate, PollResults, Modal, RichText,
@@ -71,6 +71,14 @@ export function FormateurHome() {
     await createSession({ title: title.trim() || 'Formation IA en ESMS — session 2', name: name.trim() || 'Formateur', password });
     setBusy(false);
   }
+  async function restore(e) {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setBusy(true);
+    await restoreSession({ file, name: name.trim() || 'Formateur', password });
+    setBusy(false);
+  }
   return html`<main class="center-page">
     <div class="card join-card">
       <div class="brand-big"><span class="logo" aria-hidden="true">✦</span> Espace formateur</div>
@@ -94,6 +102,13 @@ export function FormateurHome() {
         <h2 class="h3">Sessions créées sur cet appareil</h2>
         <ul class="plain">${recent.map((r) => html`<li><a href=${`/?s=${r.code}#/animer`}><b>${r.code}</b> — ${r.title}</a> <span class="muted small">${fmtDate(r.createdAt)}</span></li>`)}</ul>
       </div>` : null}
+      <div class="recent">
+        <h2 class="h3">Restaurer une session</h2>
+        <p class="muted small">Si une session a disparu (redémarrage du serveur), choisissez le fichier « Sauvegarde complète (JSON) » téléchargé depuis son tableau de bord. Elle reprend avec le même code : le lien des participants reste valable.${store.config.requirePassword ? ' Saisissez d\'abord le mot de passe formateur ci-dessus.' : ''}</p>
+        <label class="btn-secondary file-btn">📂 Choisir le fichier de sauvegarde
+          <input type="file" accept=".json,application/json" class="sr-only" disabled=${busy} onChange=${restore} />
+        </label>
+      </div>
       <p class="small"><a href="/">← Retour à l'accès participant</a></p>
     </div>
   </main>`;

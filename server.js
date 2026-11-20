@@ -16,6 +16,7 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const RETENTION_DAYS = Math.max(1, Number(process.env.RETENTION_DAYS) || 30);
 const PERSIST = process.env.PERSIST !== 'false';
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data', 'sessions.json');
+const DATABASE_URL = process.env.DATABASE_URL || '';
 const MAX_SESSIONS = 300;
 const MAX_PARTICIPANTS = 200;
 
@@ -74,9 +75,120 @@ function migrate(s) {
 }
 function touch(s) { s.lastActivity = now(); dirty = true; }
 
+// Recrée une session à partir de la « Sauvegarde complète (JSON) » téléchargée depuis le tableau de bord.
+// Le fichier ne contient pas les identifiants secrets des participants : les contributions restaurées
+// ne sont plus modifiables par leurs auteurs (seul le formateur peut les modifier), et les votes
+// sont restaurés en nombre, sans savoir qui a voté.
+function restoreSession(b, adminKey) {
+  if (!b || typeof b !== 'object' || !Array.isArray(b.contributions) || !Array.isArray(b.questions)) {
+    fail('Ce fichier n\'est pas une sauvegarde complète de l\'atelier.');
+  }
+  const code = clean(b.code, 10).toUpperCase();
+  if (!/^[A-Z0-9]{4,10}$/.test(code)) fail('Code de session invalide dans la sauvegarde.');
+  if (sessions.has(code)) fail(`La session ${code} existe déjà sur le serveur : rien à restaurer.`);
+  if (sessions.size >= MAX_SESSIONS) fail('Nombre maximal de sessions atteint sur ce serveur.');
+  const t = now();
+  const num = (v, d) => (Number.isFinite(v) && v > 0 && v <= t + 864e5 ? v : d);
+  const arr = (v) => (Array.isArray(v) ? v : []);
+  const id = (v) => clean(v, 24) || newId();
+  const fakeVoters = (n, prefix) => Array.from({ length: Math.min(Math.max(0, Math.floor(Number(n) || 0)), 500) }, (_, i) => `restored:${prefix}:${i}`);
+
+  const s = {
+    code,
+    title: clean(b.title, LIMITS.title) || 'Atelier charte IA',
+    createdAt: num(b.createdAt, t),
+    lastActivity: t,
+    adminKey: typeof adminKey === 'string' && /^[\w-]{16,64}$/.test(adminKey) ? adminKey : crypto.randomBytes(18).toString('base64url'),
+    live: { focus: null, focusAt: 0, spotlight: null },
+    spaces: {},
+    participants: {},
+    contributions: [],
+    questions: [],
+  };
+  for (const sp of SPACES) {
+    const v = b.spaces?.[sp.id] || {};
+    s.spaces[sp.id] = { locked: !!v.locked, synthesis: clean(v.synthesis, LIMITS.synthesis) };
+  }
+  for (const p of arr(b.participants).slice(0, MAX_PARTICIPANTS)) {
+    const name = clean(p?.name, LIMITS.name);
+    if (!name) continue;
+    s.participants[crypto.randomUUID()] = { uid: id(p.uid), name, isAdmin: !!p.isAdmin, joinedAt: s.createdAt, restored: true };
+  }
+  for (const q of arr(b.questions).slice(0, 200)) {
+    if (!SPACE_MAP[q?.space] || !['poll', 'open'].includes(q.type)) continue;
+    const options = q.type === 'poll' ? arr(q.options).slice(0, LIMITS.options).map((o) => clean(o, LIMITS.option)).filter(Boolean) : [];
+    const answers = {};
+    if (q.type === 'poll') options.forEach((_, i) => { for (const v of fakeVoters(q.results?.[i], `${q.id}:${i}`)) answers[v] = i; });
+    s.questions.push({
+      id: id(q.id), space: q.space, text: clean(q.text, LIMITS.question) || 'Question', type: q.type, options,
+      status: ['draft', 'open', 'closed'].includes(q.status) ? q.status : 'closed', createdAt: num(q.createdAt, t), answers,
+    });
+  }
+  const qids = new Set(s.questions.map((q) => q.id));
+  for (const c of arr(b.contributions).slice(0, LIMITS.contributions)) {
+    const space = SPACE_MAP[c?.space];
+    if (!space) continue;
+    const fields = {};
+    for (const f of space.form || []) {
+      if (f.id === 'text') continue;
+      let v = clean(c.fields?.[f.id], f.type === 'textarea' ? LIMITS.text : LIMITS.short);
+      if (f.type === 'select' && v && !f.options.some((o) => o.id === v)) v = '';
+      if (v) fields[f.id] = v;
+    }
+    const votes = {};
+    for (const [opt, n] of Object.entries(c.votes || {})) {
+      const voters = fakeVoters(n, `${c.id}:${opt}`);
+      if (/^[\w-]{1,24}$/.test(opt) && voters.length) votes[opt] = voters;
+    }
+    const createdAt = num(c.createdAt, t);
+    s.contributions.push({
+      id: id(c.id), space: space.id, questionId: qids.has(c.questionId) ? c.questionId : null, ownerPid: null,
+      author: clean(c.author, LIMITS.name) || null, text: clean(c.text, LIMITS.text), fields, tag: readTag(space, c.tag),
+      createdAt, updatedAt: c.edited ? createdAt : null, hidden: !!c.hidden, retained: !!c.retained, votes,
+      comments: arr(c.comments).slice(0, LIMITS.comments).map((m) => ({
+        id: id(m?.id), ownerPid: null, author: clean(m?.author, LIMITS.name) || null,
+        text: clean(m?.text, LIMITS.comment), createdAt: num(m?.createdAt, t), hidden: !!m?.hidden,
+      })).filter((m) => m.text),
+    });
+  }
+  migrate(s);
+  sessions.set(code, s);
+  dirty = true;
+  return s;
+}
+
 // ---------------------------------------------------------------- persistance
-function load() {
+// Avec DATABASE_URL (PostgreSQL), l'état survit aux redémarrages et mises en veille de l'hébergeur ;
+// sinon il est écrit dans un fichier JSON local.
+let db = null;
+let saving = false;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function initDb() {
+  const { default: pg } = await import('pg');
+  const ssl = /sslmode=require/.test(DATABASE_URL) || process.env.PGSSL === 'true' ? { rejectUnauthorized: false } : undefined;
+  db = new pg.Pool({ connectionString: DATABASE_URL, max: 2, ssl, connectionTimeoutMillis: 10000 });
+  db.on('error', (e) => console.error('PostgreSQL :', e.message));
+  await db.query('CREATE TABLE IF NOT EXISTS atelier_state (id text PRIMARY KEY, data text NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())');
+}
+async function load() {
   if (!PERSIST) return;
+  if (DATABASE_URL) {
+    // Ne jamais démarrer à vide si la base est injoignable : on écraserait les données au premier enregistrement.
+    for (let attempt = 1; ; attempt++) {
+      try {
+        if (!db) await initDb();
+        const { rows } = await db.query('SELECT data FROM atelier_state WHERE id = $1', ['sessions']);
+        for (const s of rows[0] ? JSON.parse(rows[0].data) : []) { migrate(s); sessions.set(s.code, s); }
+        console.log(`${sessions.size} session(s) rechargée(s) depuis PostgreSQL`);
+        return;
+      } catch (e) {
+        console.error(`Connexion à PostgreSQL impossible (essai ${attempt}/10) :`, e.message);
+        if (db) { db.end().catch(() => {}); db = null; }
+        if (attempt >= 10) throw e;
+        await sleep(3000);
+      }
+    }
+  }
   try {
     const arr = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
     for (const s of arr) { migrate(s); sessions.set(s.code, s); }
@@ -85,19 +197,33 @@ function load() {
     if (e.code !== 'ENOENT') console.error('Lecture des données impossible :', e.message);
   }
 }
-function save(force = false) {
-  if (!PERSIST || (!dirty && !force)) return;
+async function save(force = false) {
+  if (!PERSIST || saving || (!dirty && !force)) return;
   dirty = false;
+  saving = true;
   const json = JSON.stringify([...sessions.values()]);
   try {
-    fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
-    const tmp = DATA_FILE + '.tmp';
-    fs.writeFileSync(tmp, json);
-    try { fs.renameSync(tmp, DATA_FILE); } catch { fs.writeFileSync(DATA_FILE, json); fs.rmSync(tmp, { force: true }); }
+    if (db) {
+      await db.query(
+        'INSERT INTO atelier_state (id, data, updated_at) VALUES ($1, $2, now()) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = now()',
+        ['sessions', json],
+      );
+    } else {
+      fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
+      const tmp = DATA_FILE + '.tmp';
+      fs.writeFileSync(tmp, json);
+      try { fs.renameSync(tmp, DATA_FILE); } catch { fs.writeFileSync(DATA_FILE, json); fs.rmSync(tmp, { force: true }); }
+    }
   } catch (e) {
     console.error('Sauvegarde impossible :', e.message);
     dirty = true;
+  } finally {
+    saving = false;
   }
+}
+async function saveNow() {
+  for (let i = 0; saving && i < 100; i++) await sleep(50);
+  await save(true);
 }
 function purge() {
   const limit = now() - RETENTION_DAYS * 864e5;
@@ -175,6 +301,21 @@ app.get('/vendor/preact-htm.js', (req, res) => {
 });
 app.get('/api/config', (req, res) => res.json({ requirePassword: !!ADMIN_PASSWORD, retentionDays: RETENTION_DAYS }));
 app.get('/health', (req, res) => res.json({ ok: true, sessions: sessions.size }));
+let restoreAttempts = { start: 0, n: 0 };
+app.post('/api/restore', express.json({ limit: '5mb' }), (req, res) => {
+  try {
+    const t = now();
+    if (t - restoreAttempts.start > 600000) restoreAttempts = { start: t, n: 0 };
+    if (++restoreAttempts.n > 20) fail('Trop de tentatives, réessayez dans quelques minutes.');
+    if (ADMIN_PASSWORD && !safeEqual(req.body?.password || '', ADMIN_PASSWORD)) fail('Mot de passe formateur incorrect.');
+    const s = restoreSession(req.body?.backup, req.body?.adminKey);
+    console.log(`Session ${s.code} restaurée depuis une sauvegarde (${s.contributions.length} contributions)`);
+    res.json({ ok: true, code: s.code, adminKey: s.adminKey, title: s.title, contributions: s.contributions.length });
+  } catch (e) {
+    res.status(e instanceof UserError ? 400 : 500).json({ ok: false, error: e instanceof UserError ? e.message : 'Erreur inattendue.' });
+    if (!(e instanceof UserError)) console.error(e);
+  }
+});
 app.use(express.static(path.join(__dirname, 'public'), { maxAge: 0 }));
 
 const server = createServer(app);
@@ -422,9 +563,17 @@ io.on('connection', (socket) => {
       let pid = typeof p.pid === 'string' && s.participants[p.pid] ? p.pid : null;
       if (!pid) {
         if (!name) fail('Merci d\'indiquer votre prénom.');
-        if (Object.keys(s.participants).length >= MAX_PARTICIPANTS) fail('Cette session est complète.');
         pid = crypto.randomUUID();
-        s.participants[pid] = { uid: newId(), name, isAdmin, joinedAt: now() };
+        // Après une restauration, on rattache le retour d'un participant à sa fiche (même prénom) pour éviter les doublons.
+        const prior = Object.keys(s.participants).find((k) => s.participants[k].restored && s.participants[k].name.toLowerCase() === name.toLowerCase());
+        if (prior) {
+          const { restored, ...rest } = s.participants[prior];
+          delete s.participants[prior];
+          s.participants[pid] = { ...rest, name, isAdmin: isAdmin || rest.isAdmin };
+        } else {
+          if (Object.keys(s.participants).length >= MAX_PARTICIPANTS) fail('Cette session est complète.');
+          s.participants[pid] = { uid: newId(), name, isAdmin, joinedAt: now() };
+        }
       } else {
         if (name) s.participants[pid].name = name;
         if (isAdmin) s.participants[pid].isAdmin = true;
@@ -471,14 +620,14 @@ io.on('connection', (socket) => {
 });
 
 // ---------------------------------------------------------------- démarrage
-load();
+await load();
 purge();
 setInterval(() => save(), 3000).unref();
 setInterval(purge, 3600 * 1000).unref();
 for (const sig of ['SIGINT', 'SIGTERM']) {
-  process.on(sig, () => { save(true); process.exit(0); });
+  process.on(sig, () => { saveNow().finally(() => process.exit(0)); });
 }
 server.listen(PORT, () => {
-  console.log(`Atelier Charte IA prêt sur http://localhost:${PORT}`);
+  console.log(`Atelier Charte IA prêt sur http://localhost:${PORT}${db ? ' (données dans PostgreSQL)' : ''}`);
   if (!ADMIN_PASSWORD) console.log('Astuce : définissez ADMIN_PASSWORD pour réserver la création de sessions au formateur.');
 });

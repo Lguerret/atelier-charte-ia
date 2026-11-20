@@ -47,15 +47,17 @@ Ouvrez <http://localhost:3210/#/formateur>, créez la session, puis partagez le 
 
 ## 3. Déployer (accès depuis Internet)
 
-L'application est un **unique serveur Node.js** (pas de base de données). Tout hébergeur Node avec WebSockets convient.
+L'application est un **unique serveur Node.js**. Les données sont enregistrées dans une base PostgreSQL si `DATABASE_URL` est défini, sinon dans un fichier JSON. Tout hébergeur Node avec WebSockets convient.
 
 ### Option A — Render (le plus simple, offre gratuite)
 1. Déposez le dossier `atelier-charte-ia` dans un dépôt GitHub.
 2. Sur [render.com](https://render.com) : *New → Blueprint*, choisissez le dépôt (le fichier `render.yaml` est fourni).
-3. Renseignez `ADMIN_PASSWORD` (mot de passe pour créer des sessions).
+3. Renseignez `ADMIN_PASSWORD` (mot de passe pour créer des sessions). Le Blueprint crée aussi une base PostgreSQL gratuite reliée au service.
 4. L'adresse `https://<nom>.onrender.com` est prête.
 
-⚠️ Offre gratuite : le service **s'endort après 15 min d'inactivité** (réveil ~1 min) → ouvrez la page 10 min avant la séance. Le disque n'est **pas persistant** : un redéploiement efface les sessions → **exportez la synthèse en fin de séance**.
+⚠️ Offre gratuite : le service **s'endort après 15 min d'inactivité** (réveil ~1 min) → ouvrez la page 10 min avant la séance. Grâce à la base PostgreSQL, les sessions **survivent** aux mises en veille et redémarrages. La base gratuite de Render **expire 30 jours après sa création** : exportez la synthèse avant, ou passez la base en offre payante.
+
+**Restaurer une session** : si une session a disparu, ouvrez `#/formateur` et choisissez le fichier « Sauvegarde complète (JSON) » téléchargé depuis son tableau de bord. Elle reprend avec le même code. Limites : les participants ne peuvent plus modifier leurs anciennes contributions (le formateur, si), et les votes sont restaurés en nombre seulement.
 
 ### Option B — Hébergeur français / UE (recommandé pour la conformité RGPD)
 Scalingo, Clever Cloud ou Alwaysdata hébergent du Node.js en France (vérifiez le support WebSocket de l'offre choisie). Le `Procfile` fourni (`web: npm start`) suffit généralement ; le port est lu dans la variable `PORT`. Pour conserver les données entre redémarrages, rattachez un volume et pointez `DATA_FILE` dessus.
@@ -75,7 +77,8 @@ Placez-le derrière un proxy HTTPS (Caddy, Nginx) qui transmet les WebSockets.
 | `ADMIN_PASSWORD` | *(vide)* | Si défini, exigé pour **créer** une session. Recommandé en ligne. |
 | `RETENTION_DAYS` | `30` | Suppression automatique des sessions inactives depuis N jours |
 | `PERSIST` | `true` | `false` = tout en mémoire, rien sur disque |
-| `DATA_FILE` | `data/sessions.json` | Fichier de sauvegarde |
+| `DATA_FILE` | `data/sessions.json` | Fichier de sauvegarde (si pas de base) |
+| `DATABASE_URL` | *(vide)* | Base PostgreSQL : les sessions survivent aux redémarrages |
 
 ## 4. Données et confidentialité
 

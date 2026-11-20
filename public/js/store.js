@@ -155,6 +155,31 @@ export function createSession({ title, name, password }) {
   });
 }
 
+// Restaure une session à partir du fichier « Sauvegarde complète (JSON) »
+export async function restoreSession({ file, name, password }) {
+  let backup;
+  try { backup = JSON.parse(await file.text()); } catch { toast('Ce fichier n\'est pas une sauvegarde lisible (.json).', 'warn'); return false; }
+  const code = String(backup?.code || '').toUpperCase();
+  const prev = LS.get(identKey(code)) || {};
+  let res;
+  try {
+    const r = await fetch('/api/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ backup, password, adminKey: prev.adminKey }),
+    });
+    res = await r.json();
+  } catch { toast('Le serveur ne répond pas, réessayez dans un instant.', 'warn'); return false; }
+  if (!res?.ok) { toast(res?.error || 'Restauration impossible.', 'warn'); return false; }
+  LS.set(identKey(res.code), { adminKey: res.adminKey, name });
+  const list = (LS.get('charteia:admin-sessions') || []).filter((x) => x.code !== res.code);
+  LS.set('charteia:admin-sessions', [{ code: res.code, title: res.title, createdAt: backup.createdAt || Date.now() }, ...list].slice(0, 10));
+  toast(`Session ${res.code} restaurée (${res.contributions} contributions).`, 'ok');
+  const ok = await doJoin({ code: res.code, name, adminKey: res.adminKey });
+  if (ok) go('#/animer');
+  return ok;
+}
+
 // Envoie une action au serveur ; renvoie la réponse, ou null en cas d'erreur (message affiché)
 export function send(type, payload = {}) {
   if (!socket.connected) {
