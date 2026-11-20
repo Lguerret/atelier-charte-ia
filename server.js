@@ -300,7 +300,7 @@ app.get('/vendor/preact-htm.js', (req, res) => {
   res.sendFile(path.join(__dirname, 'node_modules', 'htm', 'preact', 'standalone.module.js'));
 });
 app.get('/api/config', (req, res) => res.json({ requirePassword: !!ADMIN_PASSWORD, retentionDays: RETENTION_DAYS }));
-app.get('/health', (req, res) => res.json({ ok: true, sessions: sessions.size }));
+app.get('/health', (req, res) => res.json({ ok: true, sessions: sessions.size, storage: db ? 'postgres' : PERSIST ? 'file' : 'memory' }));
 let restoreAttempts = { start: 0, n: 0 };
 app.post('/api/restore', express.json({ limit: '5mb' }), (req, res) => {
   try {
