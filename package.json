@@ -1,0 +1,24 @@
+{
+  "name": "atelier-charte-ia",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Atelier collaboratif en temps réel pour co-construire les bases d'une charte IA en ESMS",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "simulate": "node scripts/simulate.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "htm": "^3.1.1",
+    "socket.io": "^4.8.1"
+  },
+  "devDependencies": {
+    "socket.io-client": "^4.8.1"
+  }
+}
